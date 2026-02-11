@@ -148,9 +148,9 @@ The portal writes `timepico_cfg.json` and overrides firmware defaults.
 | WiFi SSID | `wifi_ssid` | `"YOUR_SSID"` |
 | WiFi password | `wifi_password` | `"YOUR_PASSWORD"` |
 | Use static IP | `use_static_ip` | `true` |
-| Static IP tuple | `static_ip` | `["192.168.10.10","255.255.255.0","192.168.10.1","192.168.10.1"]` |
-| Allowed client CIDRs | `allowed_cidrs` | `["192.168.10.0/24"]` |
-| Peer TimePicos | `peers` | `["192.168.10.11","192.168.10.12"]` |
+| Static IP tuple | `static_ip` | `["127.0.0.1","255.255.255.0","127.0.0.1","127.0.0.1"]` |
+| Allowed client CIDRs | `allowed_cidrs` | `["192.168.0.0/24"]` |
+| Peer TimePicos | `peers` | `["192.168.0.101","192.168.0.102"]` |
 | Drop NTP replies when unstable | `drop_unstable_ntp` | `true` |
 
 ### Example `timepico_cfg.json`
