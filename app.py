@@ -1,7 +1,11 @@
 # TimePico PPS NTP Server (Hardened) + Peer Voting + 7-seg Clock
-# Copyright 2026 - Matthew J. Riblett
+# + WiFi Config Portal (STA window + AP fallback)
+# + GPS-acquisition "throbber" on decimal points
 #
 # MicroPython (RP2040 / RP2350), intended for Raspberry Pi Pico W / Pico 2 W
+#
+# What’s new in this version:
+# 1) Addition of simple Daylight Savings Time (DST) toggle and display functionality.
 #
 # Minimal dependencies: MicroPython stdlib only.
 #
@@ -10,7 +14,7 @@
 # - For wired Ethernet W5x00, AP fallback does not apply; portal still opens for the first window.
 #
 # File on Pico:
-#   app.py
+#   main.py
 # Config file (created/updated by portal):
 #   timepico_cfg.json
 
@@ -28,11 +32,16 @@ DISPLAY_BRIGHTNESS_NIGHT = 0     # 0..15, used 18:00-05:59 (local)
 # Firmware version (shown on portal pages)
 TIMEPICO_VERSION = "v16.6.6"
 
-# Default URL used to pre-populate the "Update from URL" field (Official Github Repository)
-DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/riblettmj/TimePico/refs/heads/master/app.py"
+# Default URL used to pre-populate the "Update from URL" field on /u
+# Set this to the official raw GitHub URL for app.py (pin to a tag or commit for best safety).
+DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/ORG/REPO/BRANCH/app.py"
 
 # Time display format
 TIME_DISPLAY_24H = True          # True = 24-hour; False = 12-hour (no AM/PM indicator)
+
+# Manual Daylight Saving Time (DST) toggle for the *display only*
+# When enabled, local display time is shifted by +1 hour.
+DST_ENABLE = False
 
 # Hostname advertised on the network (best-effort DHCP hostname)
 HOSTNAME = "timepico"           # portal can override; blank => auto-generate
@@ -59,8 +68,8 @@ NET_MODE = "wifi"                # "wifi" (Pico W/2W) or "wiznet" (W5x00)
 # WiFi defaults (override via portal)
 WIFI_SSID = "YOUR_SSID"
 WIFI_PASSWORD = "YOUR_PASSWORD"
-USE_STATIC_IP = False
-STATIC_IP = ("127.0.0.1", "255.255.255.0", "127.0.0.1", "127.0.0.1")  # ip,mask,gw,dns
+USE_STATIC_IP = True
+STATIC_IP = ("192.168.10.10", "255.255.255.0", "192.168.10.1", "192.168.10.1")  # ip,mask,gw,dns
 
 # WIZnet defaults (override via portal if you wish; portal primarily targets wifi)
 WIZ_SPI_ID = 0
@@ -72,7 +81,7 @@ WIZ_RST = 15                   # wire W5x00 reset here (or change)
 
 # NTP
 NTP_PORT = 123
-ALLOWED_CIDRS = ["192.168.0.0/24"]   # empty list => allow all
+ALLOWED_CIDRS = ["192.168.10.0/24"]   # empty list => allow all
 # Token-bucket rate limiting (permits iBurst while limiting abuse)
 NTP_RL_BUCKET_CAP = 12            # allow bursts up to 12 replies per client
 NTP_RL_REFILL_MS = 150            # refill 1 token per 150ms (~6.6 replies/sec sustained)
@@ -89,7 +98,7 @@ NTP_DEBUG_FLASH_QUEUE_CAP = 6
 
 # Peer cross-check protocol
 PEER_PORT = 4567
-PEERS = ["192.168.0.101", "192.168.0.102"]
+PEERS = ["192.168.10.11", "192.168.10.12"]
 PEER_PSK = b"CHANGE_ME_TO_A_RANDOM_32BYTE_KEY________"
 PEER_PING_INTERVAL_MS = 5000
 PEER_SAMPLE_MAX_AGE_MS = 20000
@@ -137,7 +146,7 @@ CONFIG_PORTAL_PORT = 80
 CONFIG_PORTAL_WINDOW_S = 300          # 5 minutes after boot (STA/wired)
 WIFI_CONNECT_TIMEOUT_S = 12           # "shortly after boot"
 AP_FALLBACK_ENABLE = True
-AP_SSID_PREFIX = "TimePico-"
+AP_SSID_PREFIX = "TimePico-Setup"
 AP_IP = ("192.168.4.1", "255.255.255.0", "192.168.4.1", "192.168.4.1")
 
 
@@ -278,6 +287,7 @@ STATIC_IP = tuple(cfg_get("static_ip", STATIC_IP))
 # Hostname / time format / timezone selection
 HOSTNAME = str(cfg_get("hostname", HOSTNAME)).strip()
 TIME_DISPLAY_24H = bool(cfg_get("time_display_24h", TIME_DISPLAY_24H))
+DST_ENABLE = bool(cfg_get("dst_enable", DST_ENABLE))
 
 # Display brightness schedule
 def _parse_brightness(v, default):
@@ -310,6 +320,8 @@ def _parse_tz_offset_hours(v):
 
 TZ_OFFSET_HOURS = _parse_tz_offset_hours(cfg_get("tz_offset_hours", TZ_OFFSET_HOURS))
 TZ_OFFSET_S = int(TZ_OFFSET_HOURS * 3600)
+DST_OFFSET_S = 3600 if DST_ENABLE else 0
+LOCAL_OFFSET_S = int(TZ_OFFSET_S) + int(DST_OFFSET_S)
 
 # Auto-generate hostname if blank
 def _sanitize_hostname(h):
@@ -1495,11 +1507,14 @@ class ConfigPortal:
         # Time format        self._send_all(conn, "<hr><b>Time &amp; Display</b>")
 
         # Time format
-
+        
         opt24 = "selected" if TIME_DISPLAY_24H else ""
         opt12 = "selected" if (not TIME_DISPLAY_24H) else ""
         self._send_all(conn, "<label for='time_display'>Time display</label><select id='time_display' name='time_display'>")
         self._send_all(conn, "<option value='24' %s>24-hour</option><option value='12' %s>12-hour</option></select>" % (opt24, opt12))
+
+        dst_checked = "checked" if DST_ENABLE else ""
+        self._send_all(conn, "<label><input id='dst_enable' type='checkbox' name='dst_enable' value='1' %s> Enable DST (+1 hour)</label>" % dst_checked)
 
         # Time zone offset (numeric)
         self._send_all(conn, "<label for='tz_offset_hours'>UTC offset (hours)</label><input id='tz_offset_hours' name='tz_offset_hours' value='%s'>" % _html_escape(TZ_OFFSET_HOURS))
@@ -1943,7 +1958,7 @@ class ConfigPortal:
                     CFG["tz_offset_hours"] = tz
                 else:
                     CFG["tz_offset_hours"] = "0"
-
+                CFG["dst_enable"] = 1 if ("dst_enable" in form) else 0
 
                 # Brightness schedule
                 try:
@@ -2289,7 +2304,7 @@ def main():
                         current_brightness = DISPLAY_BRIGHTNESS_DAY
                     disp.show_dashes()
                 else:
-                    unix_s = (now_us // 1_000_000) + int(TZ_OFFSET_S)
+                    unix_s = (now_us // 1_000_000) + int(LOCAL_OFFSET_S)
                     day_s = unix_s % 86400
                     hour24 = day_s // 3600
                     hh = hour24
