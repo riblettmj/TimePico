@@ -1,6 +1,5 @@
 # TimePico PPS NTP Server (Hardened) + Peer Voting + 7-seg Clock
-# + WiFi Config Portal (STA window + AP fallback)
-# + GPS-acquisition "throbber" on decimal points
+# Copyright 2026 - Matthew J. Riblett
 #
 # MicroPython (RP2040 / RP2350), intended for Raspberry Pi Pico W / Pico 2 W
 #
@@ -14,7 +13,7 @@
 # - For wired Ethernet W5x00, AP fallback does not apply; portal still opens for the first window.
 #
 # File on Pico:
-#   main.py
+#   app.py
 # Config file (created/updated by portal):
 #   timepico_cfg.json
 
@@ -30,11 +29,11 @@ DISPLAY_BRIGHTNESS_DAY = 2       # 0..15, used 06:00-17:59 (local)
 DISPLAY_BRIGHTNESS_NIGHT = 0     # 0..15, used 18:00-05:59 (local)
 
 # Firmware version (shown on portal pages)
-TIMEPICO_VERSION = "v16.6.6"
+TIMEPICO_VERSION = "v16.7.0"
 
 # Default URL used to pre-populate the "Update from URL" field on /u
 # Set this to the official raw GitHub URL for app.py (pin to a tag or commit for best safety).
-DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/ORG/REPO/BRANCH/app.py"
+DEFAULT_UPDATE_URL = "https://raw.githubusercontent.com/riblettmj/TimePico/refs/heads/master/app.py"
 
 # Time display format
 TIME_DISPLAY_24H = True          # True = 24-hour; False = 12-hour (no AM/PM indicator)
@@ -69,7 +68,7 @@ NET_MODE = "wifi"                # "wifi" (Pico W/2W) or "wiznet" (W5x00)
 WIFI_SSID = "YOUR_SSID"
 WIFI_PASSWORD = "YOUR_PASSWORD"
 USE_STATIC_IP = True
-STATIC_IP = ("192.168.10.10", "255.255.255.0", "192.168.10.1", "192.168.10.1")  # ip,mask,gw,dns
+STATIC_IP = ("127.0.0.1", "255.255.255.0", "127.0.0.1", "127.0.0.1")  # ip,mask,gw,dns
 
 # WIZnet defaults (override via portal if you wish; portal primarily targets wifi)
 WIZ_SPI_ID = 0
@@ -81,7 +80,7 @@ WIZ_RST = 15                   # wire W5x00 reset here (or change)
 
 # NTP
 NTP_PORT = 123
-ALLOWED_CIDRS = ["192.168.10.0/24"]   # empty list => allow all
+ALLOWED_CIDRS = ["192.168.0.0/24"]   # empty list => allow all
 # Token-bucket rate limiting (permits iBurst while limiting abuse)
 NTP_RL_BUCKET_CAP = 12            # allow bursts up to 12 replies per client
 NTP_RL_REFILL_MS = 150            # refill 1 token per 150ms (~6.6 replies/sec sustained)
@@ -98,7 +97,7 @@ NTP_DEBUG_FLASH_QUEUE_CAP = 6
 
 # Peer cross-check protocol
 PEER_PORT = 4567
-PEERS = ["192.168.10.11", "192.168.10.12"]
+PEERS = ["192.168.0.101", "192.168.0.102"]
 PEER_PSK = b"CHANGE_ME_TO_A_RANDOM_32BYTE_KEY________"
 PEER_PING_INTERVAL_MS = 5000
 PEER_SAMPLE_MAX_AGE_MS = 20000
@@ -146,7 +145,7 @@ CONFIG_PORTAL_PORT = 80
 CONFIG_PORTAL_WINDOW_S = 300          # 5 minutes after boot (STA/wired)
 WIFI_CONNECT_TIMEOUT_S = 12           # "shortly after boot"
 AP_FALLBACK_ENABLE = True
-AP_SSID_PREFIX = "TimePico-Setup"
+AP_SSID_PREFIX = "TimePico"
 AP_IP = ("192.168.4.1", "255.255.255.0", "192.168.4.1", "192.168.4.1")
 
 
