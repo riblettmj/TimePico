@@ -406,12 +406,57 @@ def set_machine_rtc_from_unix(unix_us):
     except Exception:
         pass
 
+#---------------------------------------------
+# Class for performing rolling averages
+
+class Rolling_Integer:
+    def __init__(self, size_pow2=3, shift_out=0):
+        self.size_pow2 = size_pow2
+        self.shift_out = shift_out - size_pow2
+        self.max = 1 << size_pow2
+
+        self.data = [0] * self.max
+        self.dsum = 0
+
+        self.enter = 0
+        self.exit = 0
+        self.size = 0
+
+    def store(self, data):
+        if self.size == self.max:
+            self.dsum -= self.data[self.exit]
+            self.exit = (self.exit + 1) % self.max
+
+        self.data[self.enter] = data
+        self.dsum += data
+
+        self.enter = (self.enter + 1) % self.max
+        if self.size < self.max:
+            self.size += 1
+
+    def read(self):
+        out = self.dsum
+        if self.size > 0:
+            if self.size < self.max:
+                out = (self.dsum << self.size_pow2) // self.size
+
+            if self.shift_out >= 0:
+                return(out << self.shift_out)
+            else:
+                return(out >> abs(self.shift_out))
+
+    def store_read(self, data):
+        self.store(data)
+        return(self.read())
+
 # ---------------- Clock discipline with PPS + holdover + gating ---------
 FLAG_GPS_LOCK     = 0x01
 FLAG_SUSPECT      = 0x02
 FLAG_STABILIZED   = 0x04
 FLAG_STABLE_NOW   = 0x08
 FLAG_PPS_LOCK     = 0x10
+
+PERIOD_FRACTIONAL_BITS = 10
 
 class ClockDiscipline:
     def __init__(self):
@@ -455,7 +500,7 @@ class ClockDiscipline:
         if self._base_unix_us is None or self._base_ticks_us is None:
             return None
         dt = ticks_diff(ticks_us(), self._base_ticks_us)
-        dt_corr = (int(dt) * int(self._corr_q32)) >> 32
+        dt_corr = (int(dt * (1<<10)) * int(self._corr_q32)) >> 42
         est = int(self._base_unix_us) + int(dt_corr)
         if est < self._last_served:
             est = self._last_served
@@ -490,12 +535,12 @@ class ClockDiscipline:
 
     def _update_corr_from_period(self, period_us):
         if period_us <= 0: return
-        self._corr_q32 = (1_000_000 << 32) // int(period_us)
+        self._corr_q32 = (1_000_000 << (32 + PERIOD_FRACTIONAL_BITS)) // int(period_us)
 
     def _holdover_ppm(self):
         if self.pps_period_avg_us is None:
             return HOLDOVER_PPM_MIN
-        ppm_meas = abs(int(self.pps_period_avg_us) - 1_000_000)
+        ppm_meas = abs(int(self.pps_period_avg_us.read() >> PERIOD_FRACTIONAL_BITS) - 1_000_000)
         return max(HOLDOVER_PPM_MIN, ppm_meas + HOLDOVER_PPM_MARGIN)
 
     def holdover_uncertainty_us(self):
@@ -547,23 +592,27 @@ class ClockDiscipline:
     def pps_pulse(self, pps_tick_us):
         nowms = ticks_ms()
         self.last_pps_ms = nowms
+        #log("PPS:", pps_tick_us)
+        #log("UNIX:", CLOCK.now_unix_us(pps_tick_us))
 
         if self.last_pps_tick_us is not None:
             period = int(ticks_diff(int(pps_tick_us), int(self.last_pps_tick_us)))
             if PPS_PERIOD_VALID_MIN_US <= period <= PPS_PERIOD_VALID_MAX_US:
                 if self.pps_period_avg_us is None:
-                    self.pps_period_avg_us = period
-                else:
-                    self.pps_period_avg_us = (int(self.pps_period_avg_us) * 7 + period) // 8
+                    # 2^5 = 32 samples, output shifted up by 10 fractional bits
+                    self.pps_period_avg_us = Rolling_Integer(5, PERIOD_FRACTIONAL_BITS)
 
-                self._update_corr_from_period(self.pps_period_avg_us)
+                avg_us = self.pps_period_avg_us.store_read(period)
+                self._update_corr_from_period(avg_us + (1<<(PERIOD_FRACTIONAL_BITS-1)))
+                #log("PPS:", period, "R-Avg:~", float(avg_us) / (1<<PERIOD_FRACTIONAL_BITS))
 
-                if abs(int(self.pps_period_avg_us) - 1_000_000) <= PPS_LOCK_TOL_US:
+                if abs(int(avg_us >> PERIOD_FRACTIONAL_BITS) - 1_000_000) <= PPS_LOCK_TOL_US:
                     self.pps_good += 1
                 else:
                     self.pps_good = 0
                 self.pps_locked = (self.pps_good >= PPS_LOCK_COUNT)
             else:
+                #log("PPS Out-of-range:", period)
                 self.pps_period_avg_us = None
                 self.pps_good = 0
                 self.pps_locked = False
