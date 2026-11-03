@@ -218,6 +218,7 @@ def log(*a):
 def ticks_us(): return time.ticks_us()
 def ticks_ms(): return time.ticks_ms()
 def ticks_diff(a,b): return time.ticks_diff(a,b)
+def ticks_add(a,b): return time.ticks_add(a,b)
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 
 def median(vals):
@@ -1126,6 +1127,7 @@ class PeerMonitor:
 # ---------------- NTP server ----------------
 class NTPServer:
     def __init__(self):
+        self.pkt_build_us = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.sock.bind(("0.0.0.0", NTP_PORT))
@@ -1218,7 +1220,7 @@ class NTPServer:
         pkt = bytearray(48)
         struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
         struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        pkt[12:16] = ref_id[0:4].ljust(4, b"\x00")
+        struct.pack_into("!4s", pkt, 12, ref_id[0:4])
         struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)         # Reference Timestamp
         struct.pack_into("!II", pkt, 24, org_sec, org_frac)         # Originate Timestamp (client xmit)
         struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)         # Receive Timestamp
@@ -1251,7 +1253,7 @@ class NTPServer:
         pkt = bytearray(48)
         struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
         struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        pkt[12:16] = code[0:4].ljust(4, b"\x00")                    # Kiss code
+        struct.pack_into("!4s", pkt, 12, code[0:4])
         struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)
         struct.pack_into("!II", pkt, 24, org_sec, org_frac)
         struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)
@@ -1261,13 +1263,19 @@ class NTPServer:
     def serve_once(self):
         global _wl_irq_flag
 
+        pkt_build_us = 2500         # Typical delay in us
+
         while True:
+            if self.pkt_build_us:
+                pkt_build_us = int(self.pkt_build_us.read())
+
             try:
                 data, addr = self.sock.recvfrom(256)
             except OSError:
                 break
 
             # Timestamp ASAP after packet received
+            # --- START of time critical ---
             if _wl_irq_flag:
                 now1 = CLOCK.now_unix_us(int.from_bytes(_wl_irq_tick , 'little') & 0x3FFFFFFF)
                 _wl_irq_flag = False
@@ -1314,9 +1322,24 @@ class NTPServer:
                     continue
                 # else: respond but stratum will be 16 and LI alarm via CLOCK
 
-            t_xmt = CLOCK.now_unix_us() or t_recv
+            # Compensate for delay building packet, ~2500us
+            t_xmt_us = ticks_us()
+            t_xmt = CLOCK.now_unix_us(ticks_add(t_xmt_us, pkt_build_us)) or t_recv
             try:
-                self.sock.sendto(self._build_reply(data, t_recv, t_xmt), addr)
+                pkt = self._build_reply(data, t_recv, t_xmt)
+                self.sock.sendto(pkt, addr)
+                t_pkt_us = ticks_us()
+                # --- END of time critical ---
+                time.sleep_ms(1)
+
+                delay = ticks_diff(t_pkt_us, t_xmt_us)
+                if not self.pkt_build_us:
+                    self.pkt_build_us = Rolling_Integer()
+                    self.pkt_build_us.store(delay)
+                elif delay < (self.pkt_build_us.read() * 1.5):
+                    # don't store 'unusual' delays, likely GC issue
+                    self.pkt_build_us.store(ticks_diff(t_pkt_us, t_xmt_us))
+                #log("Build:", self.pkt_build_us.read())
             except Exception:
                 pass
 
