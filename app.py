@@ -496,16 +496,20 @@ class ClockDiscipline:
         if self._base_unix_us > self._last_served:
             self._last_served = self._base_unix_us
 
-    def now_unix_us(self):
+    def now_unix_us(self, now_ticks_us=None):
         if self._base_unix_us is None or self._base_ticks_us is None:
             return None
-        dt = ticks_diff(ticks_us(), self._base_ticks_us)
+        if now_ticks_us:
+            dt = ticks_diff(now_ticks_us, self._base_ticks_us)
+        else:
+            dt = ticks_diff(ticks_us(), self._base_ticks_us)
         dt_corr = (int(dt * (1<<10)) * int(self._corr_q32)) >> 42
         est = int(self._base_unix_us) + int(dt_corr)
-        if est < self._last_served:
-            est = self._last_served
-        else:
-            self._last_served = est
+        if not now_ticks_us:
+            if est < self._last_served:
+                est = self._last_served
+            else:
+                self._last_served = est
         return est
 
     def flags(self):
@@ -1255,11 +1259,23 @@ class NTPServer:
         return bytes(pkt)
 
     def serve_once(self):
+        global _wl_irq_flag
+
         while True:
             try:
                 data, addr = self.sock.recvfrom(256)
             except OSError:
                 break
+
+            # Timestamp ASAP after packet received
+            if _wl_irq_flag:
+                now1 = CLOCK.now_unix_us(int.from_bytes(_wl_irq_tick , 'little') & 0x3FFFFFFF)
+                _wl_irq_flag = False
+            else:
+                now1 = CLOCK.now_unix_us()
+            if now1 is None:
+                continue
+            t_recv = now1
 
             ip = addr[0]
             if not ip_allowed(ip):
@@ -1281,11 +1297,6 @@ class NTPServer:
                 ntp_debug_flash_trigger()
             except Exception:
                 pass
-
-            now1 = CLOCK.now_unix_us()
-            if now1 is None:
-                continue
-            t_recv = now1
 
             # Rate limit (but allow iBurst)
             if not self._rate_ok(ip):
@@ -2193,6 +2204,193 @@ def init_led():
 _pps_tick = 0
 _pps_flag = False
 
+_pps_sm = None
+
+_wl_irq_tick = bytearray(4)
+_wl_irq_flag = False
+
+# as global to prevent GC clearing them...
+dma_timestamp = None
+dma_trigger = None
+
+dma_wl_timestamp = None
+dma_wl_trigger = None
+
+import rp2
+from os import uname
+from machine import freq
+
+if 'RP2350' in uname().machine:
+    TIMERBASE = 0x400b0000      # Timer0
+    #TIMERBASE = 0x400b8000      # Timer1
+else: # rp2040
+    TIMERBASE = 0x40054000
+
+@rp2.asm_pio()
+def dma_relay():
+    wrap_target()
+
+    pull(block)                 # Pull 32-bit from TX-FIFO to ISR
+    mov(isr, osr)               # copy ISR to OSR
+    push(block)                 # Push 32-bit from OSR to RX-FIFO
+
+    wrap()
+
+@rp2.asm_pio(out_init=rp2.PIO.OUT_LOW)
+def dma_detect_gpio():
+    wrap_target()
+
+    label("wait_for_high")
+    jmp(pin, "pin_is_high")
+    wrap()
+
+    label("pin_is_high")
+    push(noblock)
+
+    label("wait_for_low")
+    jmp(pin, "wait_for_low")
+    jmp("wait_for_high")
+
+@rp2.asm_pio(sideset_init=[rp2.PIO.OUT_LOW])
+def both_pins_high():
+    label("check_pins")
+    mov(isr, invert(null)) .side(0) # clear output before checking pins
+    in_(pins, 2)
+    mov(x, invert(isr))
+
+    jmp(x_dec, "check_pins")
+
+    push(noblock) .side(1)          # notify that WIFI_IRQ has occurred
+
+    set(x, 63)                      # lengthen to ~250us to prevent retriggers
+    label("lengthen_x")
+    nop()[7]
+    nop()[7]
+    jmp(x_dec, "lengthen_x")[7]
+
+    wrap_target()
+    mov(isr, invert(null))          # load 'all ones'
+    in_(pins, 2)                    # shift in 2 bits from pins
+    mov(x, invert(isr))             # copy and invert
+
+    jmp(x_dec, "check_pins")        # jump if x!=0
+    wrap()
+
+def _wl_irq(pin):
+    global _wl_irq_tick, _wl_irq_flag
+    #_wl_irq_tick = ticks_us()
+    _wl_irq_flag = True
+
+def setup_pps_pio_dma():
+    global _pps_sm
+    global dma_timestamp, dma_trigger
+    global dma_wl_timestamp, dma_wl_trigger
+
+    if not ENABLE_PPS:
+        return None
+
+    # Set up the state machines to run as fast a possible
+    _pps_sm = []
+    _pps_sm.append(rp2.StateMachine(0, dma_relay, freq=freq()))
+    _pps_sm.append(rp2.StateMachine(1, dma_detect_gpio, freq=freq(),
+                               jmp_pin=Pin(PPS_GPIO)))
+
+    # PIO to recreate synthetic-WL-IRQ
+    if NET_MODE == "wifi":
+        p = Pin(26, Pin.IN)
+        p.irq(trigger=Pin.IRQ_RISING, handler=_wl_irq)
+        _pps_sm.append(rp2.StateMachine(2, both_pins_high, freq=int(freq()/40),
+                               in_base=Pin(24),
+                               sideset_base=Pin(26)))
+
+    for m in _pps_sm:
+        m.active(1)
+
+    # Allocate DMA channel(s)
+    dma_timestamp = rp2.DMA()
+    dma_trigger = rp2.DMA()
+
+    # configure for 32-bit timestamps
+    dma_timestamp_ctrl = dma_timestamp.pack_ctrl(
+        #treq_sel=0,                  # DREQ_PIO0_TX0 - As fast as possible?
+        size=2,                      # 4-byte transfers
+        inc_read=False,              # Don't Increment read address each time you send
+        inc_write=False,             # Write address stays the same (the Pio TX-FIFO)
+
+        high_pri = True,
+        chain_to = dma_trigger.channel,
+        enable=True)
+
+    dma_trigger_ctrl = dma_trigger.pack_ctrl(
+        treq_sel=5,                     # DREQ_PIO0_RX1
+        size=2,                         # 4-byte transfers
+        inc_read=False,                 # Don't Increment read address each time you send
+        inc_write=False,                # Write address stays the same (the Pio TX-FIFO)
+
+        high_pri = True,
+        chain_to = dma_timestamp.channel,
+        enable=True)
+
+    # Begin data transfer:
+    dma_timestamp.config(
+        read=TIMERBASE + 0x28,      # Address of TIMERAWL Register (u-sec counter)
+        write=_pps_sm[0],           # State machine object. This should go to the TX-FIFO.
+        count=1,
+        ctrl=dma_timestamp_ctrl,
+        trigger=False)
+
+    dma_trigger.config(
+        read=_pps_sm[1],                # what else can I use if I want FIFO intact?
+        write=_pps_sm[1],
+        count=1,
+        ctrl=dma_trigger_ctrl,
+        trigger=True)
+
+    if NET_MODE == "wifi":
+        dma_wl_timestamp = rp2.DMA()
+        dma_wl_trigger = rp2.DMA()
+
+        # configure for 32-bit timestamps
+        dma_wl_timestamp_ctrl = dma_wl_timestamp.pack_ctrl(
+            #treq_sel=0,                  # DREQ_PIO0_TX0 - As fast as possible?
+            size=2,                      # 4-byte transfers
+            inc_read=False,              # Don't Increment read address each time you send
+            inc_write=False,             # Write address stays the same (the Pio TX-FIFO)
+
+            high_pri = True,
+            chain_to = dma_wl_trigger.channel,
+            enable=True)
+
+        dma_wl_trigger_ctrl = dma_wl_trigger.pack_ctrl(
+            treq_sel=6,                     # DREQ_PIO0_RX2
+            size=2,                         # 4-byte transfers
+            inc_read=False,                 # Don't Increment read address each time you send
+            inc_write=False,                # Write address stays the same (the Pio TX-FIFO)
+
+            high_pri = True,
+            chain_to = dma_wl_timestamp.channel,
+            enable=True)
+
+        # Begin data transfer:
+        dma_wl_timestamp.config(
+            read=TIMERBASE + 0x28,          # Address of TIMERAWL Register (u-sec counter)
+            write=_wl_irq_tick,
+            count=1,
+            ctrl=dma_wl_timestamp_ctrl,
+            trigger=False)
+
+        dma_wl_trigger.config(
+            read=_pps_sm[2],                # what else can I use if I want FIFO intact?
+            write=_pps_sm[2],
+            count=1,
+            ctrl=dma_wl_trigger_ctrl,
+            trigger=True)
+
+        log("synthetic-WL-IRQ monitor enabled on GPIO26")
+
+    log("PPS PIO/DMA enabled on GPIO", PPS_GPIO)
+    return
+
 def _pps_irq(pin):
     global _pps_tick, _pps_flag
     _pps_tick = ticks_us()
@@ -2232,7 +2430,8 @@ def main():
     uart = UART(GPS_UART_ID, baudrate=GPS_BAUD, tx=Pin(GPS_TX), rx=Pin(GPS_RX))
     uart.init(bits=8, parity=None, stop=1)
 
-    setup_pps()
+    #setup_pps()
+    setup_pps_pio_dma()
 
     nic, nic_mode, portal = network_init_with_portal(boot_ms)
 
@@ -2272,6 +2471,10 @@ def main():
 
         # PPS event
         global _pps_flag, _pps_tick
+        global _pps_sm
+        if _pps_sm and _pps_sm[0].rx_fifo():
+            #log("PPS FIFO:", _pps_sm[0].rx_fifo())
+            CLOCK.pps_pulse(_pps_sm[0].get() & 0x3FFFFFFF)
         if _pps_flag:
             _pps_flag = False
             CLOCK.pps_pulse(_pps_tick)
