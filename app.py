@@ -636,6 +636,9 @@ class ClockDiscipline:
         self.gps_lock = bool(self.gps_valid and self.gps_fix_type == 3)
         self.last_gps_ms = nowms
 
+        if not valid:
+            return
+
         gps_unix_s = int((int(unix_us) + 500_000) // 1_000_000)
 
         aligned = False
@@ -1125,8 +1128,13 @@ class PeerMonitor:
         return med, True, len(samples)
 
 # ---------------- NTP server ----------------
+
+MAX_PKT_COUNT = 5
+NETWORK_BIAS_ADJUST = 0
+
 class NTPServer:
     def __init__(self):
+        self.pkt = bytearray(48)
         self.pkt_build_us = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
@@ -1217,15 +1225,14 @@ class NTPServer:
         rec_sec, rec_frac = ntp_from_unix_us(t_recv_us)
         xmt_sec, xmt_frac = ntp_from_unix_us(t_xmt_us)
 
-        pkt = bytearray(48)
-        struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
-        struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        struct.pack_into("!4s", pkt, 12, ref_id[0:4])
-        struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)         # Reference Timestamp
-        struct.pack_into("!II", pkt, 24, org_sec, org_frac)         # Originate Timestamp (client xmit)
-        struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)         # Receive Timestamp
-        struct.pack_into("!II", pkt, 40, xmt_sec, xmt_frac)         # Transmit Timestamp
-        return bytes(pkt)
+        struct.pack_into("!BBBB", self.pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
+        struct.pack_into("!II", self.pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
+        struct.pack_into("!4s", self.pkt, 12, ref_id[0:4])
+        struct.pack_into("!II", self.pkt, 16, ref_sec, ref_frac)    # Reference Timestamp
+        struct.pack_into("!II", self.pkt, 24, org_sec, org_frac)    # Originate Timestamp (client xmit)
+        struct.pack_into("!II", self.pkt, 32, rec_sec, rec_frac)    # Receive Timestamp
+        struct.pack_into("!II", self.pkt, 40, xmt_sec, xmt_frac)    # Transmit Timestamp
+        return
 
     def _build_kod(self, req, t_recv_us, t_xmt_us, code=b"RATE"):
         # Kiss-o'-Death packet: stratum 0, refid = 4-char code (e.g., RATE, DENY)
@@ -1250,29 +1257,48 @@ class NTPServer:
         rec_sec, rec_frac = ntp_from_unix_us(t_recv_us)
         xmt_sec, xmt_frac = ntp_from_unix_us(t_xmt_us)
 
-        pkt = bytearray(48)
-        struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
-        struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        struct.pack_into("!4s", pkt, 12, code[0:4])
-        struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)
-        struct.pack_into("!II", pkt, 24, org_sec, org_frac)
-        struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)
-        struct.pack_into("!II", pkt, 40, xmt_sec, xmt_frac)
-        return bytes(pkt)
+        struct.pack_into("!BBBB", self.pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
+        struct.pack_into("!II", self.pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
+        struct.pack_into("!4s", self.pkt, 12, code[0:4])
+        struct.pack_into("!II", self.pkt, 16, ref_sec, ref_frac)
+        struct.pack_into("!II", self.pkt, 24, org_sec, org_frac)
+        struct.pack_into("!II", self.pkt, 32, rec_sec, rec_frac)
+        struct.pack_into("!II", self.pkt, 40, xmt_sec, xmt_frac)
+        return
 
     def serve_once(self):
         global _wl_irq_flag
 
+        count = MAX_PKT_COUNT
         pkt_build_us = 2500         # Typical delay in us
 
-        while True:
+        # ensure that we don't trigger GC _DURING_ packet response
+        if gc.mem_free() < (count * 2048):
+            #log("whoops, GC happened", CLOCK.now_unix_us())
+            gc.collect()
+        #mem = gc.mem_free()
+
+        while count > 0:
             if self.pkt_build_us:
                 pkt_build_us = int(self.pkt_build_us.read())
 
             try:
+                self.sock.setblocking(False)
+                #pre = ticks_us()
                 data, addr = self.sock.recvfrom(256)
+                count -= 1
             except OSError:
-                break
+                if ENABLE_PPS == True:
+                    self.sock.setblocking(True)
+                    self.sock.settimeout(0.1)
+                    try:
+                        #pre = ticks_us()
+                        data, addr = self.sock.recvfrom(256)
+                        count -= 1
+                    except OSError:
+                        break
+                else:
+                    break
 
             # Timestamp ASAP after packet received
             # --- START of time critical ---
@@ -1299,19 +1325,15 @@ class NTPServer:
             if mode != 3:
                 continue
 
-
-            # Debug: flash DP3 on any valid NTP client request
-            try:
-                ntp_debug_flash_trigger()
-            except Exception:
-                pass
-
             # Rate limit (but allow iBurst)
             if not self._rate_ok(ip):
                 if NTP_SEND_KOD_ON_LIMIT:
+                    t_xmt_us = ticks_us()
+                    t_xmt = CLOCK.now_unix_us(ticks_add(t_xmt_us, pkt_build_us)) or t_recv
                     try:
-                        t_xmt = CLOCK.now_unix_us() or t_recv
-                        self.sock.sendto(self._build_kod(data, t_recv, t_xmt, b"RATE"), addr)
+                        self._build_kod(data, t_recv, t_xmt, b"RATE")
+                        self.sock.sendto(self.pkt, addr)
+                        # --- END of time critical ---
                     except Exception:
                         pass
                 continue
@@ -1326,23 +1348,45 @@ class NTPServer:
             t_xmt_us = ticks_us()
             t_xmt = CLOCK.now_unix_us(ticks_add(t_xmt_us, pkt_build_us)) or t_recv
             try:
-                pkt = self._build_reply(data, t_recv, t_xmt)
-                self.sock.sendto(pkt, addr)
+                self._build_reply(data, t_recv, t_xmt)
+                self.sock.sendto(self.pkt, addr)
                 t_pkt_us = ticks_us()
                 # --- END of time critical ---
                 time.sleep_ms(1)
 
-                delay = ticks_diff(t_pkt_us, t_xmt_us)
+                delay = ticks_add(ticks_diff(t_pkt_us, t_xmt_us), \
+                            NETWORK_BIAS_ADJUST)
                 if not self.pkt_build_us:
                     self.pkt_build_us = Rolling_Integer()
                     self.pkt_build_us.store(delay)
                 elif delay < (self.pkt_build_us.read() * 1.5):
                     # don't store 'unusual' delays, likely GC issue
                     self.pkt_build_us.store(ticks_diff(t_pkt_us, t_xmt_us))
-                #log("Build:", self.pkt_build_us.read())
+                #log("Build delay:", self.pkt_build_us.read())
             except Exception:
                 pass
 
+            # Debug: flash DP3 on any valid NTP client request
+            try:
+                ntp_debug_flash_trigger()
+            except Exception:
+                pass
+
+            '''
+            pre_unix_us = CLOCK.now_unix_us(pre)
+            if now1 - pre_unix_us < 0:
+                log("PRE ", pre_unix_us, now1 - pre_unix_us, _wl_irq_flag, now1, t_xmt)
+            else:
+                log("POST", pre_unix_us, now1 - pre_unix_us, _wl_irq_flag, now1, t_xmt)
+            '''
+
+        '''
+        if gc.mem_free() > mem:
+            log("Warning: GC during serve_once()!")
+        if count != MAX_PKT_COUNT:
+            log("Mem used:", mem - gc.mem_free())
+            gc.collect()
+        '''
 
 # ---------------- Config Portal ----------------
 def _html_escape(s):
@@ -2131,6 +2175,12 @@ def network_init_with_portal(boot_ms):
     if NET_MODE == "wifi":
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
+
+        # disable powersave
+        if ENABLE_PPS == True:
+            wlan.config(pm=wlan.PM_NONE)
+            log("WLAN PM disabled:", hex(wlan.config('pm')))
+
         _apply_hostname_to_wlan(wlan)
         ok = False
         if WIFI_SSID and WIFI_SSID != "YOUR_SSID":
@@ -2626,10 +2676,13 @@ def main():
             disp.draw()
             # clear flash dirty flag after pushing to display
             _ntp_flash_dirty = False
+        '''
         if (now % 5000) < 20:
             gc.collect()
+        '''
 
-        time.sleep_ms(5)
+        if ENABLE_PPS == False:
+            time.sleep_ms(5)
 
 if __name__ == "__main__":
     main()
