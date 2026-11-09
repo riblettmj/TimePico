@@ -1131,6 +1131,7 @@ class PeerMonitor:
 
 MAX_PKT_COUNT = 5
 NETWORK_BIAS_ADJUST = 0
+HAS_RECVFROM_TS = False
 
 class NTPServer:
     def __init__(self):
@@ -1139,6 +1140,17 @@ class NTPServer:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.sock.bind(("0.0.0.0", NTP_PORT))
+
+        global HAS_RECVFROM_TS
+        try:
+            # test to see if we have modified microPython build
+            self.sock.recvfrom_ts(256)
+        except OSError:
+            HAS_RECVFROM_TS = True
+            log("NTP microPython has 'recvfrom_ts()' function")
+        except:
+            pass
+
         # per-client token bucket: ip -> (tokens, last_ms)
         self.ratelimit = {}
         log("NTP server listening on UDP/%d" % NTP_PORT)
@@ -1267,8 +1279,7 @@ class NTPServer:
         return
 
     def serve_once(self):
-        global _wl_irq_flag
-
+        tstamp_pkt = None
         count = MAX_PKT_COUNT
         pkt_build_us = 2500         # Typical delay in us
 
@@ -1285,7 +1296,10 @@ class NTPServer:
             try:
                 self.sock.setblocking(False)
                 #pre = ticks_us()
-                data, addr = self.sock.recvfrom(256)
+                if HAS_RECVFROM_TS:
+                    data, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                else:
+                    data, addr = self.sock.recvfrom(256)
                 count -= 1
             except OSError:
                 if ENABLE_PPS == True:
@@ -1293,7 +1307,10 @@ class NTPServer:
                     self.sock.settimeout(0.1)
                     try:
                         #pre = ticks_us()
-                        data, addr = self.sock.recvfrom(256)
+                        if HAS_RECVFROM_TS:
+                            data, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                        else:
+                            data, addr = self.sock.recvfrom(256)
                         count -= 1
                     except OSError:
                         break
@@ -1302,11 +1319,39 @@ class NTPServer:
 
             # Timestamp ASAP after packet received
             # --- START of time critical ---
-            if _wl_irq_flag:
-                now1 = CLOCK.now_unix_us(int.from_bytes(_wl_irq_tick , 'little') & 0x3FFFFFFF)
-                _wl_irq_flag = False
+            now = ticks_us()
+            '''
+            log("Timestamp:", tstamp_pkt)
+            for i in range(8):
+                log("Wifi:", wl_irq_index, 0-i, wl_irq_data[(wl_irq_index - i) & 0b111])
+            '''
+            index = wl_irq_index
+            tstamp_irq = None
+            for i in range(8):
+                if wl_irq_data[(index - i) & 0b111][1]:
+                    tstamp = wl_irq_data[(index - i) & 0b111][0]
+                    if not HAS_RECVFROM_TS:
+                        # can't perform matching, just use latest WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        break
+                    if ticks_diff(now, tstamp) > 50_000:
+                        # IRQ is too old, expire it
+                        wl_irq_data[(index - i) & 0b111][1] = False
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 0:
+                        # packet is from earlier IRQ, skip
+                        #log("NTP timestamp lookup skipped")
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 600:
+                        # packet is within 600us of WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        wl_irq_data[(index - i) & 0b111][1] = False
+            if tstamp_irq is not None:
+                now1 = CLOCK.now_unix_us(tstamp_irq)
             else:
-                now1 = CLOCK.now_unix_us()
+                # drop, do not sent a response packet
+                #log("NTP No timestamp match", tstamp_pkt)
+                continue
             if now1 is None:
                 continue
             t_recv = now1
@@ -1373,11 +1418,16 @@ class NTPServer:
                 pass
 
             '''
+            if tstamp_pkt is not None:
+                log("NPT timestamp matched", tstamp_irq, \
+                        ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp_irq), \
+                        ticks_diff(now, tstamp_irq))
+
             pre_unix_us = CLOCK.now_unix_us(pre)
             if now1 - pre_unix_us < 0:
-                log("PRE ", pre_unix_us, now1 - pre_unix_us, _wl_irq_flag, now1, t_xmt)
+                log("PRE ", pre_unix_us, now1 - pre_unix_us, now1, t_xmt)
             else:
-                log("POST", pre_unix_us, now1 - pre_unix_us, _wl_irq_flag, now1, t_xmt)
+                log("POST", pre_unix_us, now1 - pre_unix_us, now1, t_xmt)
             '''
 
         '''
@@ -2279,8 +2329,10 @@ _pps_flag = False
 
 _pps_sm = None
 
-_wl_irq_tick = bytearray(4)
-_wl_irq_flag = False
+# store the last 8 'sWL-IRQ' timestamps
+wl_irq_data = [[0, False],[0, False],[0, False],[0, False],
+               [0, False],[0, False],[0, False],[0, False]]
+wl_irq_index = 0
 
 # as global to prevent GC clearing them...
 dma_timestamp = None
@@ -2350,9 +2402,11 @@ def both_pins_high():
     wrap()
 
 def _wl_irq(pin):
-    global _wl_irq_tick, _wl_irq_flag
-    #_wl_irq_tick = ticks_us()
-    _wl_irq_flag = True
+    global wl_irq_data, wl_irq_index
+    while _pps_sm[3].rx_fifo():
+        wl_irq_index += 1
+        wl_irq_data[wl_irq_index & 0b111][0] = _pps_sm[3].get() & 0x3FFFFFFF
+        wl_irq_data[wl_irq_index & 0b111][1] = True
 
 def setup_pps_pio_dma():
     global _pps_sm
@@ -2375,6 +2429,7 @@ def setup_pps_pio_dma():
         _pps_sm.append(rp2.StateMachine(2, both_pins_high, freq=int(freq()/40),
                                in_base=Pin(24),
                                sideset_base=Pin(26)))
+        _pps_sm.append(rp2.StateMachine(3, dma_relay, freq=freq()))
 
     for m in _pps_sm:
         m.active(1)
@@ -2447,7 +2502,7 @@ def setup_pps_pio_dma():
         # Begin data transfer:
         dma_wl_timestamp.config(
             read=TIMERBASE + 0x28,          # Address of TIMERAWL Register (u-sec counter)
-            write=_wl_irq_tick,
+            write=_pps_sm[3],               # State machine object. This should go to the TX-FIFO.
             count=1,
             ctrl=dma_wl_timestamp_ctrl,
             trigger=False)
