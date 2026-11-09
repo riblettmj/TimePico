@@ -218,6 +218,7 @@ def log(*a):
 def ticks_us(): return time.ticks_us()
 def ticks_ms(): return time.ticks_ms()
 def ticks_diff(a,b): return time.ticks_diff(a,b)
+def ticks_add(a,b): return time.ticks_add(a,b)
 def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
 
 def median(vals):
@@ -406,12 +407,57 @@ def set_machine_rtc_from_unix(unix_us):
     except Exception:
         pass
 
+#---------------------------------------------
+# Class for performing rolling averages
+
+class Rolling_Integer:
+    def __init__(self, size_pow2=3, shift_out=0):
+        self.size_pow2 = size_pow2
+        self.shift_out = shift_out - size_pow2
+        self.max = 1 << size_pow2
+
+        self.data = [0] * self.max
+        self.dsum = 0
+
+        self.enter = 0
+        self.exit = 0
+        self.size = 0
+
+    def store(self, data):
+        if self.size == self.max:
+            self.dsum -= self.data[self.exit]
+            self.exit = (self.exit + 1) % self.max
+
+        self.data[self.enter] = data
+        self.dsum += data
+
+        self.enter = (self.enter + 1) % self.max
+        if self.size < self.max:
+            self.size += 1
+
+    def read(self):
+        out = self.dsum
+        if self.size > 0:
+            if self.size < self.max:
+                out = (self.dsum << self.size_pow2) // self.size
+
+            if self.shift_out >= 0:
+                return(out << self.shift_out)
+            else:
+                return(out >> abs(self.shift_out))
+
+    def store_read(self, data):
+        self.store(data)
+        return(self.read())
+
 # ---------------- Clock discipline with PPS + holdover + gating ---------
 FLAG_GPS_LOCK     = 0x01
 FLAG_SUSPECT      = 0x02
 FLAG_STABILIZED   = 0x04
 FLAG_STABLE_NOW   = 0x08
 FLAG_PPS_LOCK     = 0x10
+
+PERIOD_FRACTIONAL_BITS = 10
 
 class ClockDiscipline:
     def __init__(self):
@@ -451,16 +497,20 @@ class ClockDiscipline:
         if self._base_unix_us > self._last_served:
             self._last_served = self._base_unix_us
 
-    def now_unix_us(self):
+    def now_unix_us(self, now_ticks_us=None):
         if self._base_unix_us is None or self._base_ticks_us is None:
             return None
-        dt = ticks_diff(ticks_us(), self._base_ticks_us)
-        dt_corr = (int(dt) * int(self._corr_q32)) >> 32
-        est = int(self._base_unix_us) + int(dt_corr)
-        if est < self._last_served:
-            est = self._last_served
+        if now_ticks_us:
+            dt = ticks_diff(now_ticks_us, self._base_ticks_us)
         else:
-            self._last_served = est
+            dt = ticks_diff(ticks_us(), self._base_ticks_us)
+        dt_corr = (int(dt * (1<<10)) * int(self._corr_q32)) >> 42
+        est = int(self._base_unix_us) + int(dt_corr)
+        if not now_ticks_us:
+            if est < self._last_served:
+                est = self._last_served
+            else:
+                self._last_served = est
         return est
 
     def flags(self):
@@ -490,12 +540,12 @@ class ClockDiscipline:
 
     def _update_corr_from_period(self, period_us):
         if period_us <= 0: return
-        self._corr_q32 = (1_000_000 << 32) // int(period_us)
+        self._corr_q32 = (1_000_000 << (32 + PERIOD_FRACTIONAL_BITS)) // int(period_us)
 
     def _holdover_ppm(self):
         if self.pps_period_avg_us is None:
             return HOLDOVER_PPM_MIN
-        ppm_meas = abs(int(self.pps_period_avg_us) - 1_000_000)
+        ppm_meas = abs(int(self.pps_period_avg_us.read() >> PERIOD_FRACTIONAL_BITS) - 1_000_000)
         return max(HOLDOVER_PPM_MIN, ppm_meas + HOLDOVER_PPM_MARGIN)
 
     def holdover_uncertainty_us(self):
@@ -547,23 +597,27 @@ class ClockDiscipline:
     def pps_pulse(self, pps_tick_us):
         nowms = ticks_ms()
         self.last_pps_ms = nowms
+        #log("PPS:", pps_tick_us)
+        #log("UNIX:", CLOCK.now_unix_us(pps_tick_us))
 
         if self.last_pps_tick_us is not None:
             period = int(ticks_diff(int(pps_tick_us), int(self.last_pps_tick_us)))
             if PPS_PERIOD_VALID_MIN_US <= period <= PPS_PERIOD_VALID_MAX_US:
                 if self.pps_period_avg_us is None:
-                    self.pps_period_avg_us = period
-                else:
-                    self.pps_period_avg_us = (int(self.pps_period_avg_us) * 7 + period) // 8
+                    # 2^5 = 32 samples, output shifted up by 10 fractional bits
+                    self.pps_period_avg_us = Rolling_Integer(5, PERIOD_FRACTIONAL_BITS)
 
-                self._update_corr_from_period(self.pps_period_avg_us)
+                avg_us = self.pps_period_avg_us.store_read(period)
+                self._update_corr_from_period(avg_us + (1<<(PERIOD_FRACTIONAL_BITS-1)))
+                #log("PPS:", period, "R-Avg:~", float(avg_us) / (1<<PERIOD_FRACTIONAL_BITS))
 
-                if abs(int(self.pps_period_avg_us) - 1_000_000) <= PPS_LOCK_TOL_US:
+                if abs(int(avg_us >> PERIOD_FRACTIONAL_BITS) - 1_000_000) <= PPS_LOCK_TOL_US:
                     self.pps_good += 1
                 else:
                     self.pps_good = 0
                 self.pps_locked = (self.pps_good >= PPS_LOCK_COUNT)
             else:
+                #log("PPS Out-of-range:", period)
                 self.pps_period_avg_us = None
                 self.pps_good = 0
                 self.pps_locked = False
@@ -581,6 +635,9 @@ class ClockDiscipline:
         self.gps_fix_type = int(fix_type) if fix_type else 0
         self.gps_lock = bool(self.gps_valid and self.gps_fix_type == 3)
         self.last_gps_ms = nowms
+
+        if not valid:
+            return
 
         gps_unix_s = int((int(unix_us) + 500_000) // 1_000_000)
 
@@ -912,6 +969,8 @@ class PeerState:
 
 class PeerMonitor:
     def __init__(self, peers):
+        self.ping_build_us = None
+        self.pong_build_us = None
         self.sender_id = unique_u32()
         self.seq = 0
         self.peers = {ip: PeerState(ip) for ip in peers}
@@ -962,19 +1021,42 @@ class PeerMonitor:
             return
         self.last_ping_ms = now
 
-        t1 = CLOCK.now_unix_us()
-        if t1 is None:
-            return
-
         flags = CLOCK.flags()
         for ip in list(self.peers.keys()):
+            ping_build_us = 4200         # Typical delay in us
+            if self.ping_build_us:
+                ping_build_us = int(self.ping_build_us.read())
+
             self.seq = (self.seq + 1) & 0xFFFF
             nonce = rand_u64()
+
+            # --- START of time critical ---
+            t_xmt_us = ticks_us()
+            t1 = CLOCK.now_unix_us(ticks_add(t_xmt_us, ping_build_us))
+            if t1 is None:
+                return
+
             pkt = self._pack(MSG_PING, flags, self.seq, self.sender_id, t1, 0, 0, nonce, self._gps_age_s(), CLOCK.ntp_stratum())
             try:
                 self.sock.sendto(pkt, (ip, PEER_PORT))
+                t_ping_us = ticks_us()
+                # --- END of time critical ---
+                time.sleep_ms(1)
+
                 self._touch()
                 self.pending[nonce] = (ip, t1, now)
+
+                #log("Peers: PING sent to", ip, t1)
+
+                delay = ticks_add(ticks_diff(t_ping_us, t_xmt_us), \
+                        NETWORK_BIAS_ADJUST)
+                if not self.ping_build_us:
+                    self.ping_build_us = Rolling_Integer()
+                    self.ping_build_us.store(delay)
+                elif delay < (self.ping_build_us.read() * 1.5):
+                    # don't store 'unusual' delays, likely GC issue
+                    self.ping_build_us.store(delay)
+                #log("Build delay:", self.ping_build_us.read())
             except Exception:
                 pass
 
@@ -983,11 +1065,55 @@ class PeerMonitor:
                 self.pending.pop(nonce, None)
 
     def handle_incoming(self):
+        global _wl_irq_flag
+
         while True:
+            tstamp_irq = None
+            tstamp_pkt = None
+            pong_build_us = 4000         # Typical delay in us
+            if self.pong_build_us:
+                pong_build_us = int(self.pong_build_us.read())
+
             try:
-                pkt, addr = self.sock.recvfrom(256)
+                if HAS_RECVFROM_TS:
+                    pkt, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                else:
+                    pkt, addr = self.sock.recvfrom(256)
             except OSError:
                 break
+
+            # Timestamp ASAP after packet received
+            # --- START of time critical ---
+            now1 = ticks_us()
+            index = wl_irq_index
+            for i in range(8):
+                if wl_irq_data[(index - i) & 0b111][1]:
+                    tstamp = wl_irq_data[(index - i) & 0b111][0]
+                    if not HAS_RECVFROM_TS:
+                        # can't perform matching, just use latest WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        break
+                    if ticks_diff(now1, tstamp) > 50_000:
+                        # IRQ is too old, expire it
+                        wl_irq_data[(index - i) & 0b111][1] = False
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 0:
+                        # packet is from earlier IRQ, skip
+                        #log("Peer Skipped")
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 600:
+                        # packet is within 600us of WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        wl_irq_data[(index - i) & 0b111][1] = False
+            if tstamp_irq is not None:
+                now = CLOCK.now_unix_us(tstamp_irq)
+            else:
+                # drop, don't send a response
+                #log("Peer No match", tstamp_pkt)
+                continue
+            if now is None:
+                continue
+
             ip = addr[0]
             if ip not in self.peers:
                 continue
@@ -1002,16 +1128,30 @@ class PeerMonitor:
             st.last_stratum = int(stratum)
 
             if typ == MSG_PING:
-                now = CLOCK.now_unix_us()
-                if now is None:
-                    continue
                 recv_us = now
-                send_us = CLOCK.now_unix_us() or recv_us
                 rflags = CLOCK.flags()
+
+                t_xmt_us = ticks_us()
+                send_us = CLOCK.now_unix_us(ticks_add(t_xmt_us, pong_build_us)) or recv_us
                 resp = self._pack(MSG_PONG, rflags, seq, self.sender_id, t1, recv_us, send_us, nonce, self._gps_age_s(), CLOCK.ntp_stratum())
                 try:
                     self.sock.sendto(resp, (ip, PEER_PORT))
+                    t_pong_us = ticks_us()
+                    # --- END of time critical ---
+                    time.sleep_ms(1)
+
                     self._touch()
+                    #log("Peers: PING-PONG to", ip, now)
+
+                    delay = ticks_add(ticks_diff(t_pong_us, t_xmt_us), \
+                            NETWORK_BIAS_ADJUST)
+                    if not self.pong_build_us:
+                        self.pong_build_us = Rolling_Integer()
+                        self.pong_build_us.store(delay)
+                    elif delay < (self.pong_build_us.read() * 1.5):
+                        # don't store 'unusual' delays, likely GC issue
+                        self.pong_build_us.store(delay)
+                    #log("Build delay:", self.pong_build_us.read())
                 except Exception:
                     pass
 
@@ -1022,16 +1162,21 @@ class PeerMonitor:
                 p_ip, p_t1, p_sent = pend
                 if p_ip != ip:
                     continue
-                t4 = CLOCK.now_unix_us()
-                if t4 is None:
-                    continue
+                t4 = now
 
                 delay = int((t4 - p_t1) - (t3 - t2))
                 offset = int(((t2 - p_t1) + (t3 - t4)) // 2)
+                #log("Peers: PONG from", ip, t4, ":", delay, offset)
 
                 st.last_sample_ms = ticks_ms()
                 st.last_offset_us = offset
                 st.last_delay_us = delay
+
+            '''
+            if tstamp_pkt is not None:
+                log("Peer Matched", tstamp_irq, ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp_irq), \
+                        ticks_diff(now1, tstamp_irq))
+            '''
 
     def _peer_eligible_voter(self, st):
         if st.suspect: return False
@@ -1071,11 +1216,29 @@ class PeerMonitor:
         return med, True, len(samples)
 
 # ---------------- NTP server ----------------
+
+MAX_PKT_COUNT = 5
+NETWORK_BIAS_ADJUST = 0
+HAS_RECVFROM_TS = False
+
 class NTPServer:
     def __init__(self):
+        self.pkt = bytearray(48)
+        self.pkt_build_us = None
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.sock.bind(("0.0.0.0", NTP_PORT))
+
+        global HAS_RECVFROM_TS
+        try:
+            # test to see if we have modified microPython build
+            self.sock.recvfrom_ts(256)
+        except OSError:
+            HAS_RECVFROM_TS = True
+            log("NTP microPython has 'recvfrom_ts()' function")
+        except:
+            pass
+
         # per-client token bucket: ip -> (tokens, last_ms)
         self.ratelimit = {}
         log("NTP server listening on UDP/%d" % NTP_PORT)
@@ -1162,15 +1325,14 @@ class NTPServer:
         rec_sec, rec_frac = ntp_from_unix_us(t_recv_us)
         xmt_sec, xmt_frac = ntp_from_unix_us(t_xmt_us)
 
-        pkt = bytearray(48)
-        struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
-        struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        pkt[12:16] = ref_id[0:4].ljust(4, b"\x00")
-        struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)         # Reference Timestamp
-        struct.pack_into("!II", pkt, 24, org_sec, org_frac)         # Originate Timestamp (client xmit)
-        struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)         # Receive Timestamp
-        struct.pack_into("!II", pkt, 40, xmt_sec, xmt_frac)         # Transmit Timestamp
-        return bytes(pkt)
+        struct.pack_into("!BBBB", self.pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
+        struct.pack_into("!II", self.pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
+        struct.pack_into("!4s", self.pkt, 12, ref_id[0:4])
+        struct.pack_into("!II", self.pkt, 16, ref_sec, ref_frac)    # Reference Timestamp
+        struct.pack_into("!II", self.pkt, 24, org_sec, org_frac)    # Originate Timestamp (client xmit)
+        struct.pack_into("!II", self.pkt, 32, rec_sec, rec_frac)    # Receive Timestamp
+        struct.pack_into("!II", self.pkt, 40, xmt_sec, xmt_frac)    # Transmit Timestamp
+        return
 
     def _build_kod(self, req, t_recv_us, t_xmt_us, code=b"RATE"):
         # Kiss-o'-Death packet: stratum 0, refid = 4-char code (e.g., RATE, DENY)
@@ -1195,22 +1357,92 @@ class NTPServer:
         rec_sec, rec_frac = ntp_from_unix_us(t_recv_us)
         xmt_sec, xmt_frac = ntp_from_unix_us(t_xmt_us)
 
-        pkt = bytearray(48)
-        struct.pack_into("!BBBB", pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
-        struct.pack_into("!II", pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
-        pkt[12:16] = code[0:4].ljust(4, b"\x00")                    # Kiss code
-        struct.pack_into("!II", pkt, 16, ref_sec, ref_frac)
-        struct.pack_into("!II", pkt, 24, org_sec, org_frac)
-        struct.pack_into("!II", pkt, 32, rec_sec, rec_frac)
-        struct.pack_into("!II", pkt, 40, xmt_sec, xmt_frac)
-        return bytes(pkt)
+        struct.pack_into("!BBBB", self.pkt, 0, first & 0xFF, stratum & 0xFF, poll & 0xFF, precision & 0xFF)
+        struct.pack_into("!II", self.pkt, 4, root_delay & 0xFFFFFFFF, root_disp & 0xFFFFFFFF)
+        struct.pack_into("!4s", self.pkt, 12, code[0:4])
+        struct.pack_into("!II", self.pkt, 16, ref_sec, ref_frac)
+        struct.pack_into("!II", self.pkt, 24, org_sec, org_frac)
+        struct.pack_into("!II", self.pkt, 32, rec_sec, rec_frac)
+        struct.pack_into("!II", self.pkt, 40, xmt_sec, xmt_frac)
+        return
 
     def serve_once(self):
-        while True:
+        tstamp_pkt = None
+        count = MAX_PKT_COUNT
+        pkt_build_us = 2500         # Typical delay in us
+
+        # ensure that we don't trigger GC _DURING_ packet response
+        if gc.mem_free() < (count * 2048):
+            #log("whoops, GC happened", CLOCK.now_unix_us())
+            gc.collect()
+        #mem = gc.mem_free()
+
+        while count > 0:
+            if self.pkt_build_us:
+                pkt_build_us = int(self.pkt_build_us.read())
+
             try:
-                data, addr = self.sock.recvfrom(256)
+                self.sock.setblocking(False)
+                #pre = ticks_us()
+                if HAS_RECVFROM_TS:
+                    data, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                else:
+                    data, addr = self.sock.recvfrom(256)
+                count -= 1
             except OSError:
-                break
+                if ENABLE_PPS == True and not peers and not portal:
+                    self.sock.setblocking(True)
+                    self.sock.settimeout(0.1)
+                    try:
+                        #pre = ticks_us()
+                        if HAS_RECVFROM_TS:
+                            data, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                        else:
+                            data, addr = self.sock.recvfrom(256)
+                        count -= 1
+                    except OSError:
+                        break
+                else:
+                    break
+
+            # Timestamp ASAP after packet received
+            # --- START of time critical ---
+            now = ticks_us()
+            '''
+            log("Timestamp:", tstamp_pkt)
+            for i in range(8):
+                log("Wifi:", wl_irq_index, 0-i, wl_irq_data[(wl_irq_index - i) & 0b111])
+            '''
+            index = wl_irq_index
+            tstamp_irq = None
+            for i in range(8):
+                if wl_irq_data[(index - i) & 0b111][1]:
+                    tstamp = wl_irq_data[(index - i) & 0b111][0]
+                    if not HAS_RECVFROM_TS:
+                        # can't perform matching, just use latest WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        break
+                    if ticks_diff(now, tstamp) > 50_000:
+                        # IRQ is too old, expire it
+                        wl_irq_data[(index - i) & 0b111][1] = False
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 0:
+                        # packet is from earlier IRQ, skip
+                        #log("NTP timestamp lookup skipped")
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 600:
+                        # packet is within 600us of WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        wl_irq_data[(index - i) & 0b111][1] = False
+            if tstamp_irq is not None:
+                now1 = CLOCK.now_unix_us(tstamp_irq)
+            else:
+                # drop, do not sent a response packet
+                #log("NTP No timestamp match", tstamp_pkt)
+                continue
+            if now1 is None:
+                continue
+            t_recv = now1
 
             ip = addr[0]
             if not ip_allowed(ip):
@@ -1226,24 +1458,15 @@ class NTPServer:
             if mode != 3:
                 continue
 
-
-            # Debug: flash DP3 on any valid NTP client request
-            try:
-                ntp_debug_flash_trigger()
-            except Exception:
-                pass
-
-            now1 = CLOCK.now_unix_us()
-            if now1 is None:
-                continue
-            t_recv = now1
-
             # Rate limit (but allow iBurst)
             if not self._rate_ok(ip):
                 if NTP_SEND_KOD_ON_LIMIT:
+                    t_xmt_us = ticks_us()
+                    t_xmt = CLOCK.now_unix_us(ticks_add(t_xmt_us, pkt_build_us)) or t_recv
                     try:
-                        t_xmt = CLOCK.now_unix_us() or t_recv
-                        self.sock.sendto(self._build_kod(data, t_recv, t_xmt, b"RATE"), addr)
+                        self._build_kod(data, t_recv, t_xmt, b"RATE")
+                        self.sock.sendto(self.pkt, addr)
+                        # --- END of time critical ---
                     except Exception:
                         pass
                 continue
@@ -1254,12 +1477,54 @@ class NTPServer:
                     continue
                 # else: respond but stratum will be 16 and LI alarm via CLOCK
 
-            t_xmt = CLOCK.now_unix_us() or t_recv
+            # Compensate for delay building packet, ~2500us
+            t_xmt_us = ticks_us()
+            t_xmt = CLOCK.now_unix_us(ticks_add(t_xmt_us, pkt_build_us)) or t_recv
             try:
-                self.sock.sendto(self._build_reply(data, t_recv, t_xmt), addr)
+                self._build_reply(data, t_recv, t_xmt)
+                self.sock.sendto(self.pkt, addr)
+                t_pkt_us = ticks_us()
+                # --- END of time critical ---
+                time.sleep_ms(1)
+
+                delay = ticks_add(ticks_diff(t_pkt_us, t_xmt_us), \
+                            NETWORK_BIAS_ADJUST)
+                if not self.pkt_build_us:
+                    self.pkt_build_us = Rolling_Integer()
+                    self.pkt_build_us.store(delay)
+                elif delay < (self.pkt_build_us.read() * 1.5):
+                    # don't store 'unusual' delays, likely GC issue
+                    self.pkt_build_us.store(ticks_diff(t_pkt_us, t_xmt_us))
+                #log("Build delay:", self.pkt_build_us.read())
             except Exception:
                 pass
 
+            # Debug: flash DP3 on any valid NTP client request
+            try:
+                ntp_debug_flash_trigger()
+            except Exception:
+                pass
+
+            '''
+            if tstamp_pkt is not None:
+                log("NPT timestamp matched", tstamp_irq, \
+                        ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp_irq), \
+                        ticks_diff(now, tstamp_irq))
+
+            pre_unix_us = CLOCK.now_unix_us(pre)
+            if now1 - pre_unix_us < 0:
+                log("PRE ", pre_unix_us, now1 - pre_unix_us, now1, t_xmt)
+            else:
+                log("POST", pre_unix_us, now1 - pre_unix_us, now1, t_xmt)
+            '''
+
+        '''
+        if gc.mem_free() > mem:
+            log("Warning: GC during serve_once()!")
+        if count != MAX_PKT_COUNT:
+            log("Mem used:", mem - gc.mem_free())
+            gc.collect()
+        '''
 
 # ---------------- Config Portal ----------------
 def _html_escape(s):
@@ -2048,6 +2313,12 @@ def network_init_with_portal(boot_ms):
     if NET_MODE == "wifi":
         wlan = network.WLAN(network.STA_IF)
         wlan.active(True)
+
+        # disable powersave
+        if ENABLE_PPS == True:
+            wlan.config(pm=wlan.PM_NONE)
+            log("WLAN PM disabled:", hex(wlan.config('pm')))
+
         _apply_hostname_to_wlan(wlan)
         ok = False
         if WIFI_SSID and WIFI_SSID != "YOUR_SSID":
@@ -2144,6 +2415,198 @@ def init_led():
 _pps_tick = 0
 _pps_flag = False
 
+_pps_sm = None
+
+# store the last 8 'sWL-IRQ' timestamps
+wl_irq_data = [[0, False],[0, False],[0, False],[0, False],
+               [0, False],[0, False],[0, False],[0, False]]
+wl_irq_index = 0
+
+# as global to prevent GC clearing them...
+dma_timestamp = None
+dma_trigger = None
+
+dma_wl_timestamp = None
+dma_wl_trigger = None
+
+import rp2
+from os import uname
+from machine import freq
+
+if 'RP2350' in uname().machine:
+    TIMERBASE = 0x400b0000      # Timer0
+    #TIMERBASE = 0x400b8000      # Timer1
+else: # rp2040
+    TIMERBASE = 0x40054000
+
+@rp2.asm_pio()
+def dma_relay():
+    wrap_target()
+
+    pull(block)                 # Pull 32-bit from TX-FIFO to ISR
+    mov(isr, osr)               # copy ISR to OSR
+    push(block)                 # Push 32-bit from OSR to RX-FIFO
+
+    wrap()
+
+@rp2.asm_pio(out_init=rp2.PIO.OUT_LOW)
+def dma_detect_gpio():
+    wrap_target()
+
+    label("wait_for_high")
+    jmp(pin, "pin_is_high")
+    wrap()
+
+    label("pin_is_high")
+    push(noblock)
+
+    label("wait_for_low")
+    jmp(pin, "wait_for_low")
+    jmp("wait_for_high")
+
+@rp2.asm_pio(sideset_init=[rp2.PIO.OUT_LOW])
+def both_pins_high():
+    label("check_pins")
+    mov(isr, invert(null)) .side(0) # clear output before checking pins
+    in_(pins, 2)
+    mov(x, invert(isr))
+
+    jmp(x_dec, "check_pins")
+
+    push(noblock) .side(1)          # notify that WIFI_IRQ has occurred
+
+    set(x, 63)                      # lengthen to ~250us to prevent retriggers
+    label("lengthen_x")
+    nop()[7]
+    nop()[7]
+    jmp(x_dec, "lengthen_x")[7]
+
+    wrap_target()
+    mov(isr, invert(null))          # load 'all ones'
+    in_(pins, 2)                    # shift in 2 bits from pins
+    mov(x, invert(isr))             # copy and invert
+
+    jmp(x_dec, "check_pins")        # jump if x!=0
+    wrap()
+
+def _wl_irq(pin):
+    global wl_irq_data, wl_irq_index
+    while _pps_sm[3].rx_fifo():
+        wl_irq_index += 1
+        wl_irq_data[wl_irq_index & 0b111][0] = _pps_sm[3].get() & 0x3FFFFFFF
+        wl_irq_data[wl_irq_index & 0b111][1] = True
+
+def setup_pps_pio_dma():
+    global _pps_sm
+    global dma_timestamp, dma_trigger
+    global dma_wl_timestamp, dma_wl_trigger
+
+    if not ENABLE_PPS:
+        return None
+
+    # Set up the state machines to run as fast a possible
+    _pps_sm = []
+    _pps_sm.append(rp2.StateMachine(0, dma_relay, freq=freq()))
+    _pps_sm.append(rp2.StateMachine(1, dma_detect_gpio, freq=freq(),
+                               jmp_pin=Pin(PPS_GPIO)))
+
+    # PIO to recreate synthetic-WL-IRQ
+    if NET_MODE == "wifi":
+        p = Pin(26, Pin.IN)
+        p.irq(trigger=Pin.IRQ_RISING, handler=_wl_irq)
+        _pps_sm.append(rp2.StateMachine(2, both_pins_high, freq=int(freq()/40),
+                               in_base=Pin(24),
+                               sideset_base=Pin(26)))
+        _pps_sm.append(rp2.StateMachine(3, dma_relay, freq=freq()))
+
+    for m in _pps_sm:
+        m.active(1)
+
+    # Allocate DMA channel(s)
+    dma_timestamp = rp2.DMA()
+    dma_trigger = rp2.DMA()
+
+    # configure for 32-bit timestamps
+    dma_timestamp_ctrl = dma_timestamp.pack_ctrl(
+        #treq_sel=0,                  # DREQ_PIO0_TX0 - As fast as possible?
+        size=2,                      # 4-byte transfers
+        inc_read=False,              # Don't Increment read address each time you send
+        inc_write=False,             # Write address stays the same (the Pio TX-FIFO)
+
+        high_pri = True,
+        chain_to = dma_trigger.channel,
+        enable=True)
+
+    dma_trigger_ctrl = dma_trigger.pack_ctrl(
+        treq_sel=5,                     # DREQ_PIO0_RX1
+        size=2,                         # 4-byte transfers
+        inc_read=False,                 # Don't Increment read address each time you send
+        inc_write=False,                # Write address stays the same (the Pio TX-FIFO)
+
+        high_pri = True,
+        chain_to = dma_timestamp.channel,
+        enable=True)
+
+    # Begin data transfer:
+    dma_timestamp.config(
+        read=TIMERBASE + 0x28,      # Address of TIMERAWL Register (u-sec counter)
+        write=_pps_sm[0],           # State machine object. This should go to the TX-FIFO.
+        count=1,
+        ctrl=dma_timestamp_ctrl,
+        trigger=False)
+
+    dma_trigger.config(
+        read=_pps_sm[1],                # what else can I use if I want FIFO intact?
+        write=_pps_sm[1],
+        count=1,
+        ctrl=dma_trigger_ctrl,
+        trigger=True)
+
+    if NET_MODE == "wifi":
+        dma_wl_timestamp = rp2.DMA()
+        dma_wl_trigger = rp2.DMA()
+
+        # configure for 32-bit timestamps
+        dma_wl_timestamp_ctrl = dma_wl_timestamp.pack_ctrl(
+            #treq_sel=0,                  # DREQ_PIO0_TX0 - As fast as possible?
+            size=2,                      # 4-byte transfers
+            inc_read=False,              # Don't Increment read address each time you send
+            inc_write=False,             # Write address stays the same (the Pio TX-FIFO)
+
+            high_pri = True,
+            chain_to = dma_wl_trigger.channel,
+            enable=True)
+
+        dma_wl_trigger_ctrl = dma_wl_trigger.pack_ctrl(
+            treq_sel=6,                     # DREQ_PIO0_RX2
+            size=2,                         # 4-byte transfers
+            inc_read=False,                 # Don't Increment read address each time you send
+            inc_write=False,                # Write address stays the same (the Pio TX-FIFO)
+
+            high_pri = True,
+            chain_to = dma_wl_timestamp.channel,
+            enable=True)
+
+        # Begin data transfer:
+        dma_wl_timestamp.config(
+            read=TIMERBASE + 0x28,          # Address of TIMERAWL Register (u-sec counter)
+            write=_pps_sm[3],               # State machine object. This should go to the TX-FIFO.
+            count=1,
+            ctrl=dma_wl_timestamp_ctrl,
+            trigger=False)
+
+        dma_wl_trigger.config(
+            read=_pps_sm[2],                # what else can I use if I want FIFO intact?
+            write=_pps_sm[2],
+            count=1,
+            ctrl=dma_wl_trigger_ctrl,
+            trigger=True)
+
+        log("synthetic-WL-IRQ monitor enabled on GPIO26")
+
+    log("PPS PIO/DMA enabled on GPIO", PPS_GPIO)
+    return
+
 def _pps_irq(pin):
     global _pps_tick, _pps_flag
     _pps_tick = ticks_us()
@@ -2160,7 +2623,7 @@ def setup_pps():
 
 # ---------------- Main ----------------
 def main():
-    global _ntp_flash_dirty
+    global _ntp_flash_dirty, peers, portal
     gc.collect()
     boot_ms = ticks_ms()
     led = init_led()
@@ -2183,12 +2646,16 @@ def main():
     uart = UART(GPS_UART_ID, baudrate=GPS_BAUD, tx=Pin(GPS_TX), rx=Pin(GPS_RX))
     uart.init(bits=8, parity=None, stop=1)
 
-    setup_pps()
+    #setup_pps()
+    setup_pps_pio_dma()
 
     nic, nic_mode, portal = network_init_with_portal(boot_ms)
 
     ntp = NTPServer()
-    peers = PeerMonitor(PEERS)
+    peers = None
+    if len(PEERS):
+        log("Peers:", PEERS)
+        peers = PeerMonitor(PEERS)
 
     last_display_ms = 0
     colon = False
@@ -2223,6 +2690,10 @@ def main():
 
         # PPS event
         global _pps_flag, _pps_tick
+        global _pps_sm
+        if _pps_sm and _pps_sm[0].rx_fifo():
+            #log("PPS FIFO:", _pps_sm[0].rx_fifo())
+            CLOCK.pps_pulse(_pps_sm[0].get() & 0x3FFFFFFF)
         if _pps_flag:
             _pps_flag = False
             CLOCK.pps_pulse(_pps_tick)
@@ -2241,10 +2712,11 @@ def main():
                     CLOCK.gps_rmc(unix_us, valid, fix_type, ticks_us())
 
         # Peer protocol
-        peers.handle_incoming()
-        peers.send_pings_if_due()
-        med_off, good, count = peers.evaluate()
-        CLOCK.consider_peers(med_off, good, count)
+        if peers:
+            peers.handle_incoming()
+            peers.send_pings_if_due()
+            med_off, good, count = peers.evaluate()
+            CLOCK.consider_peers(med_off, good, count)
 
         # NTP
         ntp.serve_once()
@@ -2351,10 +2823,13 @@ def main():
             disp.draw()
             # clear flash dirty flag after pushing to display
             _ntp_flash_dirty = False
+        '''
         if (now % 5000) < 20:
             gc.collect()
+        '''
 
-        time.sleep_ms(5)
+        if ENABLE_PPS == False:
+            time.sleep_ms(5)
 
 if __name__ == "__main__":
     main()
