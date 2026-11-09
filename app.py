@@ -969,6 +969,8 @@ class PeerState:
 
 class PeerMonitor:
     def __init__(self, peers):
+        self.ping_build_us = None
+        self.pong_build_us = None
         self.sender_id = unique_u32()
         self.seq = 0
         self.peers = {ip: PeerState(ip) for ip in peers}
@@ -1019,19 +1021,42 @@ class PeerMonitor:
             return
         self.last_ping_ms = now
 
-        t1 = CLOCK.now_unix_us()
-        if t1 is None:
-            return
-
         flags = CLOCK.flags()
         for ip in list(self.peers.keys()):
+            ping_build_us = 4200         # Typical delay in us
+            if self.ping_build_us:
+                ping_build_us = int(self.ping_build_us.read())
+
             self.seq = (self.seq + 1) & 0xFFFF
             nonce = rand_u64()
+
+            # --- START of time critical ---
+            t_xmt_us = ticks_us()
+            t1 = CLOCK.now_unix_us(ticks_add(t_xmt_us, ping_build_us))
+            if t1 is None:
+                return
+
             pkt = self._pack(MSG_PING, flags, self.seq, self.sender_id, t1, 0, 0, nonce, self._gps_age_s(), CLOCK.ntp_stratum())
             try:
                 self.sock.sendto(pkt, (ip, PEER_PORT))
+                t_ping_us = ticks_us()
+                # --- END of time critical ---
+                time.sleep_ms(1)
+
                 self._touch()
                 self.pending[nonce] = (ip, t1, now)
+
+                #log("Peers: PING sent to", ip, t1)
+
+                delay = ticks_add(ticks_diff(t_ping_us, t_xmt_us), \
+                        NETWORK_BIAS_ADJUST)
+                if not self.ping_build_us:
+                    self.ping_build_us = Rolling_Integer()
+                    self.ping_build_us.store(delay)
+                elif delay < (self.ping_build_us.read() * 1.5):
+                    # don't store 'unusual' delays, likely GC issue
+                    self.ping_build_us.store(delay)
+                #log("Build delay:", self.ping_build_us.read())
             except Exception:
                 pass
 
@@ -1040,11 +1065,55 @@ class PeerMonitor:
                 self.pending.pop(nonce, None)
 
     def handle_incoming(self):
+        global _wl_irq_flag
+
         while True:
+            tstamp_irq = None
+            tstamp_pkt = None
+            pong_build_us = 4000         # Typical delay in us
+            if self.pong_build_us:
+                pong_build_us = int(self.pong_build_us.read())
+
             try:
-                pkt, addr = self.sock.recvfrom(256)
+                if HAS_RECVFROM_TS:
+                    pkt, addr, tstamp_pkt = self.sock.recvfrom_ts(256)
+                else:
+                    pkt, addr = self.sock.recvfrom(256)
             except OSError:
                 break
+
+            # Timestamp ASAP after packet received
+            # --- START of time critical ---
+            now1 = ticks_us()
+            index = wl_irq_index
+            for i in range(8):
+                if wl_irq_data[(index - i) & 0b111][1]:
+                    tstamp = wl_irq_data[(index - i) & 0b111][0]
+                    if not HAS_RECVFROM_TS:
+                        # can't perform matching, just use latest WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        break
+                    if ticks_diff(now1, tstamp) > 50_000:
+                        # IRQ is too old, expire it
+                        wl_irq_data[(index - i) & 0b111][1] = False
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 0:
+                        # packet is from earlier IRQ, skip
+                        #log("Peer Skipped")
+                        continue
+                    if ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp) < 600:
+                        # packet is within 600us of WL-IRQ timestamp
+                        tstamp_irq = tstamp
+                        wl_irq_data[(index - i) & 0b111][1] = False
+            if tstamp_irq is not None:
+                now = CLOCK.now_unix_us(tstamp_irq)
+            else:
+                # drop, don't send a response
+                #log("Peer No match", tstamp_pkt)
+                continue
+            if now is None:
+                continue
+
             ip = addr[0]
             if ip not in self.peers:
                 continue
@@ -1059,16 +1128,30 @@ class PeerMonitor:
             st.last_stratum = int(stratum)
 
             if typ == MSG_PING:
-                now = CLOCK.now_unix_us()
-                if now is None:
-                    continue
                 recv_us = now
-                send_us = CLOCK.now_unix_us() or recv_us
                 rflags = CLOCK.flags()
+
+                t_xmt_us = ticks_us()
+                send_us = CLOCK.now_unix_us(ticks_add(t_xmt_us, pong_build_us)) or recv_us
                 resp = self._pack(MSG_PONG, rflags, seq, self.sender_id, t1, recv_us, send_us, nonce, self._gps_age_s(), CLOCK.ntp_stratum())
                 try:
                     self.sock.sendto(resp, (ip, PEER_PORT))
+                    t_pong_us = ticks_us()
+                    # --- END of time critical ---
+                    time.sleep_ms(1)
+
                     self._touch()
+                    #log("Peers: PING-PONG to", ip, now)
+
+                    delay = ticks_add(ticks_diff(t_pong_us, t_xmt_us), \
+                            NETWORK_BIAS_ADJUST)
+                    if not self.pong_build_us:
+                        self.pong_build_us = Rolling_Integer()
+                        self.pong_build_us.store(delay)
+                    elif delay < (self.pong_build_us.read() * 1.5):
+                        # don't store 'unusual' delays, likely GC issue
+                        self.pong_build_us.store(delay)
+                    #log("Build delay:", self.pong_build_us.read())
                 except Exception:
                     pass
 
@@ -1079,16 +1162,21 @@ class PeerMonitor:
                 p_ip, p_t1, p_sent = pend
                 if p_ip != ip:
                     continue
-                t4 = CLOCK.now_unix_us()
-                if t4 is None:
-                    continue
+                t4 = now
 
                 delay = int((t4 - p_t1) - (t3 - t2))
                 offset = int(((t2 - p_t1) + (t3 - t4)) // 2)
+                #log("Peers: PONG from", ip, t4, ":", delay, offset)
 
                 st.last_sample_ms = ticks_ms()
                 st.last_offset_us = offset
                 st.last_delay_us = delay
+
+            '''
+            if tstamp_pkt is not None:
+                log("Peer Matched", tstamp_irq, ticks_diff(tstamp_pkt & 0x3FFFFFFF, tstamp_irq), \
+                        ticks_diff(now1, tstamp_irq))
+            '''
 
     def _peer_eligible_voter(self, st):
         if st.suspect: return False
@@ -1302,7 +1390,7 @@ class NTPServer:
                     data, addr = self.sock.recvfrom(256)
                 count -= 1
             except OSError:
-                if ENABLE_PPS == True:
+                if ENABLE_PPS == True and not peers and not portal:
                     self.sock.setblocking(True)
                     self.sock.settimeout(0.1)
                     try:
@@ -2535,7 +2623,7 @@ def setup_pps():
 
 # ---------------- Main ----------------
 def main():
-    global _ntp_flash_dirty
+    global _ntp_flash_dirty, peers, portal
     gc.collect()
     boot_ms = ticks_ms()
     led = init_led()
@@ -2564,7 +2652,10 @@ def main():
     nic, nic_mode, portal = network_init_with_portal(boot_ms)
 
     ntp = NTPServer()
-    peers = PeerMonitor(PEERS)
+    peers = None
+    if len(PEERS):
+        log("Peers:", PEERS)
+        peers = PeerMonitor(PEERS)
 
     last_display_ms = 0
     colon = False
@@ -2621,10 +2712,11 @@ def main():
                     CLOCK.gps_rmc(unix_us, valid, fix_type, ticks_us())
 
         # Peer protocol
-        peers.handle_incoming()
-        peers.send_pings_if_due()
-        med_off, good, count = peers.evaluate()
-        CLOCK.consider_peers(med_off, good, count)
+        if peers:
+            peers.handle_incoming()
+            peers.send_pings_if_due()
+            med_off, good, count = peers.evaluate()
+            CLOCK.consider_peers(med_off, good, count)
 
         # NTP
         ntp.serve_once()
